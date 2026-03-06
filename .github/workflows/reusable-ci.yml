@@ -84,4 +84,5 @@ jobs:
       - run: cd client && npm ci
       - run: cd client && npm run lint --if-present
       - run: cd client && npm run test:coverage --if-present
-      - run: cd client && npx tsc --noEmit
+      - name: Client typecheck
+        run: cd client && (npm run typecheck 2>/dev/null || npx tsc --noEmit)
