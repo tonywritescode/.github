@@ -1,18 +1,25 @@
 # =============================================================================
 # Reusable Deploy Workflow — tonycodes/.github
 # =============================================================================
-# Builds Docker image on VPS and updates/creates Swarm service.
-# Called by each repo's deploy.yml with repo-specific inputs.
+# Triggers a Coolify deployment via API and waits for completion.
+# Coolify handles: git pull, Docker build, container restart, migrations
+# (via post_deployment_command configured in Coolify).
+#
+# Auto-deploy is DISABLED on all Coolify apps. This workflow is the only
+# deploy trigger, ensuring CI must pass before deployment.
+#
+# Required secrets (passed explicitly — secrets:inherit doesn't work cross-owner):
+#   COOLIFY_API_TOKEN — Coolify API bearer token
 #
 # Usage:
 #   jobs:
 #     deploy:
 #       uses: tonycodes/.github/.github/workflows/reusable-deploy.yml@main
 #       with:
-#         app_name: my-app
-#         prod_domain: my-app.com
-#         migration_command: 'npx prisma migrate deploy'
-#       secrets: inherit
+#         app_uuid: a0g0wgkgggwwsockokoowo8c
+#         prod_domain: tony.codes
+#       secrets:
+#         COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
 # =============================================================================
 
 name: Deploy
@@ -23,266 +30,108 @@ on:
       runs_on:
         description: 'Runner (JSON): "ubuntu-latest" or ["self-hosted"]'
         type: string
-        default: '["self-hosted"]'
-      node_version:
-        description: 'Node.js version'
-        type: string
-        default: '20'
-      app_name:
-        description: 'Docker image / Swarm service name (e.g. ai-chat-widget)'
+        default: '"ubuntu-latest"'
+      app_uuid:
+        description: 'Coolify application UUID'
         type: string
         required: true
+      coolify_url:
+        description: 'Coolify API base URL (public, HTTPS)'
+        type: string
+        default: 'https://coolify.tony.codes'
       prod_domain:
-        description: 'Production domain for health checks (e.g. getflow.chat)'
+        description: 'Production domain for health check verification'
         type: string
         required: true
-      vps_host:
-        description: 'VPS IP address'
-        type: string
-        default: '89.167.111.113'
-      network:
-        description: 'Docker Swarm overlay network'
-        type: string
-        default: 'traefik-public'
-      migration_command:
-        description: 'Post-deploy migration command (runs inside container)'
-        type: string
-        default: ''
-      seed_command:
-        description: 'Post-deploy seed command (runs inside container)'
-        type: string
-        default: ''
-      worker_name:
-        description: 'Worker Swarm service name (e.g. prod_autopilot_worker)'
-        type: string
-        default: ''
-      worker_command:
-        description: 'Worker entrypoint command (e.g. node server/worker.js)'
-        type: string
-        default: ''
-      vite_env_from_swarm:
-        description: 'Read VITE_* vars from .env.swarm as docker build args'
-        type: boolean
-        default: false
-      build_args:
-        description: 'Additional docker build args (e.g. --build-arg FOO=bar)'
-        type: string
-        default: ''
-      post_deploy_script:
-        description: 'Custom shell commands to run on VPS after deploy'
-        type: string
-        default: ''
       health_endpoint:
         description: 'Health check path (e.g. /health or /api/health)'
         type: string
         default: '/health'
-      docker_volumes:
-        description: 'Docker volume mount flags for service create'
-        type: string
-        default: ''
-      docker_target:
-        description: 'Docker build target stage (e.g. production)'
-        type: string
-        default: ''
+      deploy_timeout:
+        description: 'Max seconds to wait for deployment to finish'
+        type: number
+        default: 300
     secrets:
-      VPS_SSH_KEY:
-        description: 'SSH private key for VPS access'
+      COOLIFY_API_TOKEN:
+        description: 'Coolify API bearer token'
         required: true
+
 jobs:
   deploy:
     name: Deploy to Production
     runs-on: ${{ fromJson(inputs.runs_on) }}
     concurrency:
-      group: deploy-${{ inputs.vps_host }}
+      group: deploy-${{ inputs.app_uuid }}
       cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node_version }}
-
-      - name: Set build metadata
+      - name: Trigger Coolify deployment
+        id: trigger
         run: |
-          GIT_SHA=$(git rev-parse --short HEAD)
-          echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
-          echo "BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
-          APP_VERSION=$(git describe --tags --always 2>/dev/null || echo "0.0.0")
-          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          RESPONSE=$(curl -sf "${{ inputs.coolify_url }}/api/v1/deploy?uuid=${{ inputs.app_uuid }}&force=false" \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_API_TOKEN }}")
 
-      - name: Setup SSH
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+          echo "Response: $RESPONSE"
 
-      - name: Configure SSH
+          DEPLOY_UUID=$(echo "$RESPONSE" | jq -r '.deployments[0].deployment_uuid // empty')
+          if [ -z "$DEPLOY_UUID" ]; then
+            echo "Failed to trigger deployment"
+            exit 1
+          fi
+
+          echo "deployment_uuid=$DEPLOY_UUID" >> $GITHUB_OUTPUT
+          echo "Deployment triggered: $DEPLOY_UUID"
+
+      - name: Wait for deployment
         run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ inputs.vps_host }} >> ~/.ssh/known_hosts 2>/dev/null
+          DEPLOY_UUID="${{ steps.trigger.outputs.deployment_uuid }}"
+          TIMEOUT=${{ inputs.deploy_timeout }}
+          ELAPSED=0
+          INTERVAL=10
 
-      - name: Pull latest code on VPS
-        run: |
-          ssh root@${{ inputs.vps_host }} "cd /root/apps/${{ inputs.app_name }} && git fetch origin main && git reset --hard origin/main"
+          echo "Waiting for deployment $DEPLOY_UUID (timeout: ${TIMEOUT}s)..."
 
-      - name: Build and deploy
-        run: |
-          ssh root@${{ inputs.vps_host }} << 'TONYCODES_DEPLOY'
-          set -e
-          cd /root/apps/${{ inputs.app_name }}
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(curl -sf "${{ inputs.coolify_url }}/api/v1/deployments/$DEPLOY_UUID" \
+              -H "Authorization: Bearer ${{ secrets.COOLIFY_API_TOKEN }}" \
+              | jq -r '.status // "unknown"')
 
-          # ── Compute env args from .env.swarm ──
-          ENV_ADD=""
-          ENV_CREATE=""
-          if [ -f .env.swarm ]; then
-            while IFS= read -r line; do
-              [ -z "$line" ] || [ "${line:0:1}" = "#" ] && continue
-              ENV_ADD="$ENV_ADD --env-add $line"
-              ENV_CREATE="$ENV_CREATE --env $line"
-            done < .env.swarm
-          fi
+            echo "[$ELAPSED/${TIMEOUT}s] Status: $STATUS"
 
-          # ── Build Docker image ──
-          BUILD_ARGS="--build-arg GIT_SHA=${{ env.GIT_SHA }} --build-arg BUILD_TIME=${{ env.BUILD_TIME }} --build-arg APP_VERSION=${{ env.APP_VERSION }}"
+            case "$STATUS" in
+              finished)
+                echo "Deployment completed successfully"
+                exit 0
+                ;;
+              failed|cancelled|error)
+                echo "Deployment failed with status: $STATUS"
+                exit 1
+                ;;
+            esac
 
-          if [ "${{ inputs.vite_env_from_swarm }}" = "true" ] && [ -f .env.swarm ]; then
-            while IFS='=' read -r key value; do
-              case "$key" in
-                VITE_*) BUILD_ARGS="$BUILD_ARGS --build-arg ${key}=${value}" ;;
-              esac
-            done < .env.swarm
-          fi
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
 
-          # ── Docker target stage ──
-          TARGET_FLAG=""
-          if [ -n "${{ inputs.docker_target }}" ]; then
-            TARGET_FLAG="--target ${{ inputs.docker_target }}"
-          fi
+          echo "Deployment timed out after ${TIMEOUT}s"
+          exit 1
 
-          echo "Building image: ${{ inputs.app_name }}:${{ env.GIT_SHA }}"
-          eval docker build \
-            $TARGET_FLAG \
-            $BUILD_ARGS \
-            ${{ inputs.build_args }} \
-            -t ${{ inputs.app_name }}:${{ env.GIT_SHA }} .
-
-          docker tag ${{ inputs.app_name }}:${{ env.GIT_SHA }} ${{ inputs.app_name }}:latest
-
-          # ── Deploy main service ──
-          if docker service inspect prod_${{ inputs.app_name }} >/dev/null 2>&1; then
-            echo "Updating service: prod_${{ inputs.app_name }}"
-            eval docker service update \
-              --image ${{ inputs.app_name }}:${{ env.GIT_SHA }} \
-              $ENV_ADD \
-              --replicas 1 \
-              --update-parallelism 1 \
-              --update-delay 10s \
-              --update-failure-action rollback \
-              prod_${{ inputs.app_name }}
-          else
-            echo "Creating service: prod_${{ inputs.app_name }}"
-            eval docker service create \
-              --name prod_${{ inputs.app_name }} \
-              --replicas 1 \
-              --network ${{ inputs.network }} \
-              --update-parallelism 1 \
-              --update-delay 10s \
-              --update-failure-action rollback \
-              --restart-condition on-failure \
-              --restart-delay 5s \
-              --restart-max-attempts 3 \
-              ${{ inputs.docker_volumes }} \
-              $ENV_CREATE \
-              ${{ inputs.app_name }}:${{ env.GIT_SHA }}
-          fi
-
-          echo "Waiting for rollout..."
-          timeout 120 sh -c 'until docker service ps prod_${{ inputs.app_name }} --filter "desired-state=running" --format "{{.CurrentState}}" | grep -q "Running"; do sleep 5; done'
-
-          # ── Deploy worker service (if configured) ──
-          WORKER_NAME="${{ inputs.worker_name }}"
-          WORKER_CMD="${{ inputs.worker_command }}"
-          if [ -n "$WORKER_NAME" ] && [ -n "$WORKER_CMD" ]; then
-            if docker service inspect $WORKER_NAME >/dev/null 2>&1; then
-              echo "Updating worker: $WORKER_NAME"
-              eval docker service update \
-                --image ${{ inputs.app_name }}:${{ env.GIT_SHA }} \
-                $ENV_ADD \
-                $WORKER_NAME
-            else
-              echo "Creating worker: $WORKER_NAME"
-              eval docker service create \
-                --name $WORKER_NAME \
-                --replicas 1 \
-                --network ${{ inputs.network }} \
-                --restart-condition on-failure \
-                --restart-delay 5s \
-                --restart-max-attempts 3 \
-                $ENV_CREATE \
-                ${{ inputs.app_name }}:${{ env.GIT_SHA }} \
-                $WORKER_CMD
-            fi
-          fi
-
-          # ── Migrations ──
-          MIGRATION_CMD="${{ inputs.migration_command }}"
-          if [ -n "$MIGRATION_CMD" ]; then
-            echo "Running migrations..."
-            sleep 10
-            CONTAINER_ID=$(docker ps -q -f name=prod_${{ inputs.app_name }} | head -1)
-            if [ -n "$CONTAINER_ID" ]; then
-              docker exec $CONTAINER_ID $MIGRATION_CMD
-            else
-              echo "ERROR: No running container found for migration"
-              exit 1
-            fi
-          fi
-
-          # ── Seed ──
-          SEED_CMD="${{ inputs.seed_command }}"
-          if [ -n "$SEED_CMD" ]; then
-            echo "Running seed..."
-            CONTAINER_ID=$(docker ps -q -f name=prod_${{ inputs.app_name }} | head -1)
-            if [ -n "$CONTAINER_ID" ]; then
-              docker exec $CONTAINER_ID $SEED_CMD
-            fi
-          fi
-
-          # ── Custom post-deploy ──
-          ${{ inputs.post_deploy_script }}
-
-          # ── Summary ──
-          echo ""
-          echo "=== Deployment Complete ==="
-          echo "Image: ${{ inputs.app_name }}:${{ env.GIT_SHA }}"
-          docker service ps prod_${{ inputs.app_name }} --format "table {{.Name}}\t{{.Image}}\t{{.CurrentState}}"
-
-          # ── Cleanup old images (keep current SHA + latest only) ──
-          docker images ${{ inputs.app_name }} --format "{{.ID}} {{.Tag}} {{.CreatedAt}}" | sort -k3 -r | grep -v latest | tail -n +2 | awk '{print $1}' | xargs -r docker rmi 2>/dev/null || true
-          docker builder prune -f --filter "until=24h" 2>/dev/null || true
-          TONYCODES_DEPLOY
-
-      - name: Verify deployment
+      - name: Verify health
         run: |
           echo "Verifying deployment..."
-          sleep 10
+          sleep 5
+
           HEALTH=$(curl -sf "https://${{ inputs.prod_domain }}${{ inputs.health_endpoint }}" 2>/dev/null || echo "")
           if [ -z "$HEALTH" ]; then
-            echo "Health endpoint not responding yet (may need time for SSL)"
+            echo "Health endpoint not responding (may need more time)"
             exit 0
           fi
-          echo "Health: $HEALTH"
-          DEPLOYED=$(echo "$HEALTH" | jq -r '.build.commit // empty' 2>/dev/null || echo "")
-          if [ -n "$DEPLOYED" ] && [ "$DEPLOYED" = "${{ env.GIT_SHA }}" ]; then
-            echo "Commit verified: $DEPLOYED"
-          fi
 
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "Deployment failed!"
-          echo "Manual recovery:"
-          echo "  ssh root@${{ inputs.vps_host }}"
-          echo "  docker service logs prod_${{ inputs.app_name }} --tail 50"
-          echo "  docker service rollback prod_${{ inputs.app_name }}"
-          exit 1
+          echo "Health: $HEALTH"
+
+          STATUS=$(echo "$HEALTH" | jq -r '.status // empty' 2>/dev/null || echo "")
+          if [ "$STATUS" = "ok" ] || [ "$STATUS" = "healthy" ]; then
+            echo "Health check passed"
+          else
+            echo "Unexpected health status: $STATUS"
+          fi

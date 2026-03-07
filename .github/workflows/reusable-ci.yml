@@ -2,8 +2,7 @@
 # Reusable CI Workflow — tonycodes/.github
 # =============================================================================
 # Runs quality checks and tests on PRs.
-# Optimized for self-hosted runners: combines lightweight checks into one job
-# to minimize redundant npm ci calls.
+# Runs quality checks, linting, and tests in parallel.
 #
 # Usage:
 #   jobs:
@@ -22,7 +21,7 @@ on:
       runs_on:
         description: 'Runner (JSON): "ubuntu-latest" or ["self-hosted"]'
         type: string
-        default: '["self-hosted"]'
+        default: '"ubuntu-latest"'
       node_version:
         description: 'Node.js version'
         type: string
