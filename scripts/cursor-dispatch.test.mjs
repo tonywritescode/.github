@@ -479,7 +479,7 @@ test("readme documents the caller snippet", () => {
   const pin = cursor.match(
     /cursor-agent-dispatch\.yml@([0-9a-f]{40})/,
   )[1];
-  const merge = "e88b0681dd54fc6d69b4bc528b1e5477f04e9da5";
+  const merge = "33d4473de9080f2df50427ce34f2e42c7843763f";
   for (const stale of [
     "495edcafe5c8e647c7f45f973e54e02b51118c34",
     "f8d16f54aa1263425bb1849d64c3dbb5ee06f008",
