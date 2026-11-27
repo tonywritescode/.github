@@ -1,0 +1,22 @@
+# Copy to <repo>/.github/workflows/grok-pr-review.yml
+name: Grok PR review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: grok-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  grok-review:
+    uses: tonywritescode/.github/.github/workflows/reusable-grok-pr-review.yml@main
+    secrets: inherit
+    with:
+      runs_on: ${{ github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '["self-hosted","tony-mac"]') || '"ubuntu-latest"' }}

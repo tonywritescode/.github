@@ -1,0 +1,160 @@
+# Reusable Grok + Hive PR review gate for tonywritescode org repos.
+#
+# Caller (in each repo):
+#
+#   name: Grok PR review
+#   on:
+#     pull_request:
+#       branches: [main]
+#       types: [opened, synchronize, reopened, ready_for_review]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   jobs:
+#     grok-review:
+#       uses: tonywritescode/.github/.github/workflows/reusable-grok-pr-review.yml@main
+#       secrets: inherit
+#       with:
+#         runs_on: ${{ vars.RUNS_ON || '["self-hosted","tony-mac"]' }}
+#
+# Required secrets (org or repo; passed via secrets: inherit):
+#   XAI_API_KEY (or GROK_API_KEY)
+#   HIVE_API_KEY (or ARC_REVIEW_KEY)
+#
+# Optional vars on the caller repo:
+#   GROK_PR_REVIEW_ENABLED=false
+#   GROK_PR_REVIEW_ALLOW_WITHOUT_HIVE=true
+name: Reusable Grok PR review
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: JSON runs-on value (string or array JSON)
+        type: string
+        default: '["self-hosted","tony-mac"]'
+      scripts_ref:
+        description: Ref of tonywritescode/.github to load review scripts from
+        type: string
+        default: main
+    secrets:
+      XAI_API_KEY:
+        required: false
+      GROK_API_KEY:
+        required: false
+      HIVE_API_KEY:
+        required: false
+      ARC_REVIEW_KEY:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  grok-review:
+    name: Grok review
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout review scripts
+        uses: actions/checkout@v4
+        with:
+          repository: tonywritescode/.github
+          ref: ${{ inputs.scripts_ref }}
+          path: _tony_grok_review
+          sparse-checkout: |
+            scripts/grok-pr-review
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve secrets
+        id: key
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+          HIVE_API_KEY: ${{ secrets.HIVE_API_KEY }}
+          ARC_REVIEW_KEY: ${{ secrets.ARC_REVIEW_KEY }}
+          ENABLED: ${{ vars.GROK_PR_REVIEW_ENABLED }}
+          ALLOW_WITHOUT_HIVE: ${{ vars.GROK_PR_REVIEW_ALLOW_WITHOUT_HIVE }}
+        run: |
+          set -euo pipefail
+          if [ "${ENABLED:-true}" = "false" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Grok PR review disabled via GROK_PR_REVIEW_ENABLED=false"
+            exit 0
+          fi
+          XKEY="${XAI_API_KEY:-${GROK_API_KEY:-}}"
+          HKEY="${HIVE_API_KEY:-${ARC_REVIEW_KEY:-}}"
+          if [ -z "$XKEY" ]; then
+            echo "::error::Missing XAI_API_KEY (or GROK_API_KEY). Set as an org or repo Actions secret."
+            exit 1
+          fi
+          if [ -z "$HKEY" ] && [ "${ALLOW_WITHOUT_HIVE:-}" != "true" ]; then
+            echo "::error::Missing HIVE_API_KEY (or ARC_REVIEW_KEY). Required for Hive-backed Grok review."
+            exit 1
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$XKEY"
+          [ -n "$HKEY" ] && echo "::add-mask::$HKEY"
+          {
+            echo "xai_key=$XKEY"
+            echo "hive_key=$HKEY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Collect PR diff and files
+        if: steps.key.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh pr diff ${{ github.event.pull_request.number }} --repo "$GITHUB_REPOSITORY" > /tmp/pr.diff
+          gh api "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files?per_page=100" \
+            --paginate --jq '.[].filename' > /tmp/changed-files.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          raw = Path('/tmp/pr.diff').read_text(errors='replace')
+          limit = 180_000
+          out = raw if len(raw) <= limit else raw[:limit] + "\n\n…[diff truncated for model prompt]…\n"
+          Path('/tmp/pr-prompt.diff').write_text(out)
+          files = [ln for ln in Path('/tmp/changed-files.txt').read_text().splitlines() if ln.strip()]
+          print(f'diff_bytes={len(raw)} prompt_bytes={len(out)} files={len(files)}')
+          PY
+
+      - name: Ask Grok (with Hive context)
+        if: steps.key.outputs.skip != 'true'
+        env:
+          XAI_API_KEY: ${{ steps.key.outputs.xai_key }}
+          HIVE_API_KEY: ${{ steps.key.outputs.hive_key }}
+          GROK_PR_REVIEW_ALLOW_WITHOUT_HIVE: ${{ vars.GROK_PR_REVIEW_ALLOW_WITHOUT_HIVE }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 _tony_grok_review/scripts/grok-pr-review/grok_pr_review.py \
+            --diff /tmp/pr-prompt.diff \
+            --changed-files /tmp/changed-files.txt \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY" \
+            --url "$PR_URL" \
+            --repo "$GITHUB_REPOSITORY" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --out /tmp/grok-review.json
+
+      - name: Publish review and gate
+        if: steps.key.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python3 _tony_grok_review/scripts/grok-pr-review/grok_pr_review_publish.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --pr "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --review /tmp/grok-review.json
