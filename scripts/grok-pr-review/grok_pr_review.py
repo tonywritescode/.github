@@ -63,12 +63,33 @@ def _http_json(url: str, api_key: str, payload: dict, timeout: int = 30) -> dict
     return json.loads(raw.decode("utf-8"))
 
 
+def _hive_candidates(repository: str, hive_repository: str | None) -> list[str]:
+    """Repos to try for Hive scope during owner migrations."""
+    out: list[str] = []
+    if hive_repository:
+        out.append(hive_repository)
+    out.append(repository)
+    if "/" in repository:
+        owner, name = repository.split("/", 1)
+        if owner == "tonywritescode":
+            out.append(f"tonycodes/{name}")
+    # de-dupe preserving order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for r in out:
+        if r and r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    return uniq
+
+
 def fetch_hive_context(
     *,
     repository: str,
     base_revision: str,
     head_revision: str,
     changed_files: list[str],
+    hive_repository: str | None = None,
 ) -> dict:
     """POST /api/review-context — same contract as the Gitea Grok reviewer."""
     key = (
@@ -94,37 +115,52 @@ def fetch_hive_context(
             "Set GROK_PR_REVIEW_ALLOW_WITHOUT_HIVE=true only as an emergency bypass."
         )
 
-    body = {
-        "repository": repository,
-        "base_revision": base_revision,
-        "head_revision": head_revision,
-        "changed_files": changed_files[:500],
-        "limit": 40,
-    }
-    try:
-        context = _http_json(HIVE_REVIEW_URL, key, body, timeout=30)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, RuntimeError, ValueError) as exc:
-        if allow_without:
-            print(f"Hive context unavailable ({exc}); continuing without graph", flush=True)
-            return {"available": False, "reason": f"Hive unavailable: {exc}"}
-        raise SystemExit(f"Hive review-context failed: {exc}") from exc
+    last_exc: Exception | None = None
+    for repo_name in _hive_candidates(repository, hive_repository):
+        body = {
+            "repository": repo_name,
+            "base_revision": base_revision,
+            "head_revision": head_revision,
+            "changed_files": changed_files[:500],
+            "limit": 40,
+        }
+        try:
+            context = _http_json(HIVE_REVIEW_URL, key, body, timeout=30)
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            # 404 = not indexed under this owner/name; try next candidate.
+            if exc.code == 404:
+                print(f"Hive: {repo_name} not indexed (404); trying fallback…", flush=True)
+                continue
+            break
+        except (urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
+            last_exc = exc
+            break
+        else:
+            encoded = json.dumps(context, separators=(",", ":")).encode("utf-8")
+            if len(encoded) > HIVE_BUDGET:
+                if allow_without:
+                    return {"available": False, "reason": "Hive context exceeded 60 KB budget"}
+                raise SystemExit("Hive review-context exceeded 60 KB budget")
+            context["available"] = True
+            context["requested_repository"] = repository
+            context["hive_repository"] = repo_name
+            print(
+                "Hive graph context loaded; hive_repository=",
+                repo_name,
+                " exact_revision=",
+                bool(context.get("exact_revision")),
+                " index_status=",
+                context.get("index_status"),
+                sep="",
+                flush=True,
+            )
+            return context
 
-    encoded = json.dumps(context, separators=(",", ":")).encode("utf-8")
-    if len(encoded) > HIVE_BUDGET:
-        if allow_without:
-            return {"available": False, "reason": "Hive context exceeded 60 KB budget"}
-        raise SystemExit("Hive review-context exceeded 60 KB budget")
-
-    context["available"] = True
-    print(
-        "Hive graph context loaded; exact_revision=",
-        bool(context.get("exact_revision")),
-        " index_status=",
-        context.get("index_status"),
-        sep="",
-        flush=True,
-    )
-    return context
+    if allow_without:
+        print(f"Hive context unavailable ({last_exc}); continuing without graph", flush=True)
+        return {"available": False, "reason": f"Hive unavailable: {last_exc}"}
+    raise SystemExit(f"Hive review-context failed: {last_exc}")
 
 
 def main() -> int:
@@ -133,7 +169,8 @@ def main() -> int:
     parser.add_argument("--title", required=True)
     parser.add_argument("--body", default="")
     parser.add_argument("--url", required=True)
-    parser.add_argument("--repo", required=True, help="owner/name, e.g. tonycodes/auth.tony.codes")
+    parser.add_argument("--repo", required=True, help="owner/name, e.g. tonywritescode/gitdocs")
+    parser.add_argument("--hive-repo", default="", help="optional Hive scope override (e.g. tonycodes/gitdocs)")
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--changed-files", required=True, help="newline-separated paths file")
@@ -155,6 +192,7 @@ def main() -> int:
         base_revision=args.base_sha,
         head_revision=args.head_sha,
         changed_files=changed_files,
+        hive_repository=(args.hive_repo or None),
     )
 
     user = (

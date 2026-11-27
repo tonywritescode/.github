@@ -37,6 +37,12 @@ on:
         description: Ref of tonywritescode/.github to load review scripts from
         type: string
         default: main
+      hive_repository:
+        description: >
+          Optional Hive scope override (owner/name). Use when the GitHub repo
+          moved to tonywritescode but Hive still indexes tonycodes/<name>.
+        type: string
+        default: ""
     secrets:
       XAI_API_KEY:
         required: false
@@ -134,6 +140,10 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          HIVE_REPO_ARGS=()
+          if [ -n "${{ inputs.hive_repository }}" ]; then
+            HIVE_REPO_ARGS=(--hive-repo "${{ inputs.hive_repository }}")
+          fi
           python3 _tony_grok_review/scripts/grok-pr-review/grok_pr_review.py \
             --diff /tmp/pr-prompt.diff \
             --changed-files /tmp/changed-files.txt \
@@ -143,6 +153,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --base-sha "$BASE_SHA" \
             --head-sha "$HEAD_SHA" \
+            "${HIVE_REPO_ARGS[@]}" \
             --out /tmp/grok-review.json
 
       - name: Publish review and gate
