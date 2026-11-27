@@ -1,0 +1,93 @@
+# =============================================================================
+# Reusable CI Workflow — tonywritescode/.github
+# =============================================================================
+# Runs quality checks and tests on PRs.
+# Optimized for self-hosted runners: combines lightweight checks into one job
+# to minimize redundant npm ci calls.
+#
+# Usage:
+#   jobs:
+#     ci:
+#       uses: tonywritescode/.github/.github/workflows/reusable-ci.yml@main
+#       with:
+#         has_prisma: true
+#         has_client: true
+# =============================================================================
+
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner (JSON): "ubuntu-latest" or ["self-hosted"]'
+        type: string
+        default: '["self-hosted"]'
+      node_version:
+        description: 'Node.js version'
+        type: string
+        default: '20'
+      has_prisma:
+        description: 'Run prisma generate before typecheck/test'
+        type: boolean
+        default: false
+      has_client:
+        description: 'Run client/ lint, tests, and typecheck'
+        type: boolean
+        default: false
+      has_mcp:
+        description: 'Run mcp-server/ typecheck'
+        type: boolean
+        default: false
+
+jobs:
+  quality:
+    name: Typecheck & Lint
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          # GitHub-hosted only. On self-hosted Mac the Actions npm cache often
+          # downloads ~2GB then fails auth mid-restore, burning 10–20 minutes
+          # for no hit. npm ci is usually seconds for these trees.
+          cache: ${{ runner.environment == 'github-hosted' && 'npm' || '' }}
+      - run: npm ci
+      - if: ${{ inputs.has_prisma }}
+        run: npx prisma generate
+      - run: npm run typecheck --if-present
+      - run: npm run lint --if-present
+      - if: ${{ inputs.has_mcp }}
+        run: npm run typecheck:mcp
+
+  test:
+    name: Server Tests
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          # GitHub-hosted only. On self-hosted Mac the Actions npm cache often
+          # downloads ~2GB then fails auth mid-restore, burning 10–20 minutes
+          # for no hit. npm ci is usually seconds for these trees.
+          cache: ${{ runner.environment == 'github-hosted' && 'npm' || '' }}
+      - run: npm ci
+      - if: ${{ inputs.has_prisma }}
+        run: npx prisma generate
+      - run: npm run test:coverage --if-present
+
+  client:
+    name: Client Tests
+    if: ${{ inputs.has_client }}
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - run: cd client && npm ci
+      - run: cd client && npm run lint --if-present
+      - run: cd client && npm run test:coverage --if-present
+      - run: cd client && npx tsc --noEmit
