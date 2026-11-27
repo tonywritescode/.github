@@ -1,4 +1,4 @@
-# Copy to <repo>/.github/workflows/grok-pr-review.yml
+# Thin caller for tonywritescode shared Grok + Hive review gate.
 name: Grok PR review
 
 on:
@@ -17,6 +17,10 @@ permissions:
 jobs:
   grok-review:
     uses: tonywritescode/.github/.github/workflows/reusable-grok-pr-review.yml@main
-    secrets: inherit
+    secrets:
+      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+      GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+      HIVE_API_KEY: ${{ secrets.HIVE_API_KEY }}
+      ARC_REVIEW_KEY: ${{ secrets.ARC_REVIEW_KEY }}
     with:
       runs_on: ${{ github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '["self-hosted","tony-mac"]') || '"ubuntu-latest"' }}

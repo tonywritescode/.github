@@ -48,7 +48,17 @@ See `examples/grok-pr-review.yml` for a ready-to-copy file.
 | `XAI_API_KEY` (or `GROK_API_KEY`) | xAI chat completions |
 | `HIVE_API_KEY` (or `ARC_REVIEW_KEY`) | Company-scoped Hive key (`Bearer arc_…`) |
 
-Set these as **organization secrets** visible to all repositories (or selected repos), then `secrets: inherit` picks them up.
+Set these as **organization secrets** with visibility **All repositories** (or explicitly include each consumer).
+
+Callers should pass secrets by name (not only `secrets: inherit`) so named `workflow_call` secrets are populated:
+
+```yaml
+secrets:
+  XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+  GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+  HIVE_API_KEY: ${{ secrets.HIVE_API_KEY }}
+  ARC_REVIEW_KEY: ${{ secrets.ARC_REVIEW_KEY }}
+```
 
 ### Optional repository variables
 
